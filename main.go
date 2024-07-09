@@ -5,109 +5,163 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"strconv"
 
 	"github.com/gorilla/mux"
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/rs/cors"
 )
 
 type Todo struct {
-	ID    int    `json:"id"`
-	Title string `json:"title"`
+	ID     int    `json:"id"`
+	Task   string `json:"task"`
+	UserID string `json:"user_id"`
+}
+
+type User struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
 }
 
 var db *sql.DB
 
-func main() {
+func initDB() {
 	var err error
-	db, err = sql.Open("sqlite3", "todo.db")
+	db, err = sql.Open("sqlite3", "./todos.db")
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer db.Close()
 
-	// Create Todo table if not exists
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS todo (
+	createUsersTable := `
+	CREATE TABLE IF NOT EXISTS users (
+		id TEXT PRIMARY KEY,
+		name TEXT
+	);`
+
+	createTodosTable := `
+	CREATE TABLE IF NOT EXISTS todos (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		title TEXT
-	);`)
-	if err != nil {
+		task TEXT,
+		user_id TEXT,
+		FOREIGN KEY(user_id) REFERENCES users(id)
+	);`
+
+	if _, err := db.Exec(createUsersTable); err != nil {
 		log.Fatal(err)
 	}
 
-	r := mux.NewRouter()
-
-	r.HandleFunc("/todos", getTodos).Methods("GET")
-	r.HandleFunc("/todos", addTodo).Methods("POST")
-
-	// CORS middleware
-	corsMiddleware := func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Access-Control-Allow-Origin", "*")
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-
-			if r.Method == "OPTIONS" {
-				w.WriteHeader(http.StatusOK)
-				return
-			}
-
-			next.ServeHTTP(w, r)
-		})
+	if _, err := db.Exec(createTodosTable); err != nil {
+		log.Fatal(err)
 	}
 
-	log.Println("Server listening on :8080...")
-	log.Fatal(http.ListenAndServe(":8080", corsMiddleware(r)))
+	// Insert users if not already present
+	users := []User{
+		{ID: "shelley", Name: "Shelley"},
+		{ID: "keagan", Name: "Keagan"},
+		{ID: "dane", Name: "Dane"},
+		{ID: "paul", Name: "Paul"},
+	}
+	for _, user := range users {
+		if _, err := db.Exec("INSERT OR IGNORE INTO users (id, name) VALUES (?, ?)", user.ID, user.Name); err != nil {
+			log.Fatal(err)
+		}
+	}
 }
 
-func getTodos(w http.ResponseWriter, r *http.Request) {
-	rows, err := db.Query("SELECT id, title FROM todo ORDER BY id DESC")
+func GetTodos(w http.ResponseWriter, r *http.Request) {
+	todos, err := getAllTodos()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	defer rows.Close()
 
-	todos := make([]Todo, 0)
-	for rows.Next() {
-		var todo Todo
-		err := rows.Scan(&todo.ID, &todo.Title)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		todos = append(todos, todo)
-	}
-	if err = rows.Err(); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(todos)
 }
 
-func addTodo(w http.ResponseWriter, r *http.Request) {
+func CreateTodo(w http.ResponseWriter, r *http.Request) {
 	var todo Todo
-	err := json.NewDecoder(r.Body).Decode(&todo)
+	if err := json.NewDecoder(r.Body).Decode(&todo); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if err := addTodo(&todo); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(todo)
+}
+
+func DeleteTodo(w http.ResponseWriter, r *http.Request) {
+	params := mux.Vars(r)
+	id, err := strconv.Atoi(params["id"])
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	result, err := db.Exec("INSERT INTO todo (title) VALUES (?)", todo.Title)
-	if err != nil {
+	if err := removeTodoByID(id); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func getAllTodos() ([]Todo, error) {
+	rows, err := db.Query("SELECT id, task, user_id FROM todos")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var todos []Todo
+	for rows.Next() {
+		var todo Todo
+		if err := rows.Scan(&todo.ID, &todo.Task, &todo.UserID); err != nil {
+			return nil, err
+		}
+		todos = append(todos, todo)
+	}
+	return todos, nil
+}
+
+func addTodo(todo *Todo) error {
+	result, err := db.Exec("INSERT INTO todos (task, user_id) VALUES (?, ?)", todo.Task, todo.UserID)
+	if err != nil {
+		return err
 	}
 
 	id, err := result.LastInsertId()
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		return err
 	}
-
 	todo.ID = int(id)
+	return nil
+}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(todo)
+func removeTodoByID(id int) error {
+	_, err := db.Exec("DELETE FROM todos WHERE id = ?", id)
+	return err
+}
+
+func main() {
+	initDB()
+
+	router := mux.NewRouter()
+	router.HandleFunc("/todos", GetTodos).Methods("GET")
+	router.HandleFunc("/todos", CreateTodo).Methods("POST")
+	router.HandleFunc("/todos/{id}", DeleteTodo).Methods("DELETE")
+
+	c := cors.New(cors.Options{
+		AllowedOrigins: []string{"*"},
+		AllowedMethods: []string{"GET", "POST", "DELETE"},
+	})
+
+	handler := c.Handler(router)
+
+	log.Println("Server started on :9090")
+	log.Fatal(http.ListenAndServe(":9090", handler))
 }
